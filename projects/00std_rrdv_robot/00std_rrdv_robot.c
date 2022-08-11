@@ -37,19 +37,27 @@
 #define NUMBER_OF_BYTES_TO_SEND    5UL
 
 // timer 
+#define fromMsToTics     16000 // prescaler 0 -> 16Mhz timer
 #define defaultCmpValue  0xDEADBEEF  // big value to initialize when we don't want timer to elapse
 #define cmdDur_ms        0.65 
 #define maxCmdDur_ms     1 
 #define triggerOffset_ms 0.01 
 #define triggerDur_ms    0.01 
 #define echoDuration_ms  180  
-#define tdmaTimeSlot_ms  1  
+#define tdmaTimeSlot_ms  1.1  
 #define robotTxOffset_ms 1 
 #define wdTx_ms          0.01 
 #define notifDur_ms      0.65 
-#define ifsDur_ms        0.01 
+#define ifsDur_ms        0.1 
 #define maxNotifDur_ms   1    
 #define tdmaDelayTx(id) (tdmaTimeSlot_ms*id)
+#define DURATION_rt1    maxCmdDur_ms * fromMsToTics 
+#define DURATION_rt2    triggerOffset_ms * fromMsToTics
+#define DURATION_rt3    triggerDur_ms * fromMsToTics
+#define DURATION_rt4    echoDuration_ms * fromMsToTics
+#define DURATION_rt6    (robotTxOffset_ms + wdTx_ms) * fromMsToTics
+#define DURATION_rt7    maxNotifDur_ms * fromMsToTics
+#define DURATION_rt8    ifsDur_ms * fromMsToTics
 
 // ppi
 #define channel_ri0_or_ri8              0UL
@@ -106,7 +114,7 @@ typedef struct {
     //robot
     uint8_t       robot_id;
     uint16_t      robot_bitmask; // up to 16 robots
-    uint8_t       tdmaDelayTx_ms;
+    double        DURATION_rt5;
     robot_state_t state;
     //radio
     uint8_t       dataToSendRadio[NUMBER_OF_BYTES_TO_SEND];
@@ -311,7 +319,7 @@ void activity_ri0(void){
     NRF_PPI->CHENCLR = ppiChannelClrEnable << channel_ri7_or_10;  
   
     //set CC[0] to elapse when US trigger needs to be activated
-    NRF_TIMER0->CC[0] = (maxCmdDur_ms) * 16000;
+    NRF_TIMER0->CC[0] = DURATION_rt1;
 
     // enable ppi channel for waiting the end of frame and clear the timer
     NRF_PPI->CHENSET = ppiChannelSetEnable << channel_ri0_or_ri8;  
@@ -329,7 +337,7 @@ void activity_ri1(void) {
     NRF_PPI->CHENCLR = ppiChannelClrEnable << channel_ri0_or_ri8; 
     NRF_PPI->CHENCLR = ppiChannelClrEnable << channel_rie0_or_rie1_or_rie2; 
 
-    // Copy packet into the buffer, before sending it to the callback.
+    // Copy packet into the Rx buffer
     memcpy(robot_vars.dataReceivedRadio, robot_vars.radioPacket, NUMBER_OF_BYTES_IN_PACKET);
 
     // packet received from the gateway, PPI already enabled when we end up here
@@ -347,7 +355,7 @@ void activity_ri1(void) {
             changeState(S_USPREPARE);
 
             // set CC[0] to a triggerOffset
-            NRF_TIMER0->CC[0] = triggerOffset_ms * 16000;
+            NRF_TIMER0->CC[0] = DURATION_rt2;
 
             // enable ppi channel for US sensor trigger pulse high, it happens after triggerOffset
             NRF_PPI->CHENSET = ppiChannelSetEnable << channel_ri1; 
@@ -390,7 +398,6 @@ void activity_rie0(void) {
     toggle_isr_debug_pin();
     printf("ERROR rie0 packet received too long\r\n");
     printf("current value of the timer: %d", NRF_TIMER0->CC[1]);    
-    __NOP();
     toggle_isr_debug_pin();
 }
 
@@ -402,7 +409,7 @@ void activity_ri2(void) {
     NRF_PPI->CHENCLR = ppiChannelClrEnable << channel_ri1;
 
     //set CC[0] to elapse after defined US trigger duration
-    NRF_TIMER0->CC[0] = (triggerDur_ms) * 16000;
+    NRF_TIMER0->CC[0] = DURATION_rt3;
 
     // enable ppi channel for setting Low US sensor pin when timer elapses
     NRF_PPI->CHENSET = ppiChannelSetEnable << channel_ri2;
@@ -417,7 +424,7 @@ void activity_ri3(void) {
     NRF_PPI->CHENCLR = ppiChannelClrEnable << channel_ri2;
 
     //set CC[0] to elapse after defined US trigger duration
-    NRF_TIMER0->CC[0] = (echoDuration_ms) * 16000;
+    NRF_TIMER0->CC[0] = DURATION_rt4;
 
     // enable the ppi channel for capturing the time when the Echo pin goes High
     NRF_PPI->CHENSET = ppiChannelSetEnable << channel_ri3;
@@ -483,7 +490,7 @@ void activity_ri6(void) {
     NRF_PPI->CHENCLR = ppiChannelClrEnable << channel_ri5;
     
     //set CC[0] to elapse after defined TDMA delay duration
-    NRF_TIMER0->CC[0] = (robot_vars.tdmaDelayTx_ms) * 16000;
+    NRF_TIMER0->CC[0] = robot_vars.DURATION_rt5;
     
     // enable the ppi channel set when timer elapses after the TDMA delay, Radio Tx is also triggered after the timer elapses
     NRF_PPI->CHENSET = ppiChannelSetEnable << channel_ri6;
@@ -498,7 +505,7 @@ void activity_ri7(void) {
     NRF_PPI->CHENCLR = ppiChannelClrEnable << channel_ri6;
     
     //set CC[0] to elapse after watchdog
-    NRF_TIMER0->CC[0] = (robotTxOffset_ms + wdTx_ms) * 16000;
+    NRF_TIMER0->CC[0] = DURATION_rt6;
     
     // enable the ppi channel for waiting the start of the frame event
     NRF_PPI->CHENSET = ppiChannelSetEnable << channel_ri7_or_10;
@@ -513,7 +520,6 @@ void activity_rie1(void) {
     toggle_isr_debug_pin();
     printf("ERROR rie1 packet not send at the right time\r\n");
     printf("current value of the timer: %d", NRF_TIMER0->CC[1]);
-    __NOP();
     toggle_isr_debug_pin();
 }
 
@@ -526,7 +532,7 @@ void activity_ri8(void) {
     NRF_PPI->CHENCLR = ppiChannelClrEnable << channel_rie0_or_rie1_or_rie2;
     
     //set CC[0] to elapse after defined watchdog set for message sending
-    NRF_TIMER0->CC[0] = (maxNotifDur_ms) * 16000;
+    NRF_TIMER0->CC[0] = DURATION_rt7;
     
     // enable ppi channel for waiting the end of frame and clear the timer
     NRF_PPI->CHENSET = ppiChannelSetEnable << channel_ri0_or_ri8;
@@ -539,7 +545,6 @@ void activity_rie2(void) {
     toggle_isr_debug_pin();    
     printf("ERROR rie2 packet too long\r\n");
     printf("current value of the timer: %d", NRF_TIMER0->CC[1]);
-    __NOP();
     toggle_isr_debug_pin();
 }
 
@@ -552,7 +557,7 @@ void activity_ri9(void) {
     NRF_PPI->CHENCLR = ppiChannelClrEnable << channel_rie0_or_rie1_or_rie2;
     
     //set CC[0] to elapse after defined IFS duration
-    NRF_TIMER0->CC[0] = (ifsDur_ms) * 16000;
+    NRF_TIMER0->CC[0] = DURATION_rt8;
 
     // enable ppi channel for waiting the timer for IFS to elapse
     NRF_PPI->CHENSET = ppiChannelSetEnable << channel_ri9;
@@ -772,9 +777,9 @@ void ppi_setup(void) {
     NRF_PPI->CH[channel_ri6].TEP         = timer0_task_clear_addr;
     NRF_PPI->FORK[channel_ri6].TEP       = radio_tasks_txen_addr; 
 
-    //enable in ri7 || dissable in ri8
-    NRF_PPI->CH[channel_ri7_or_10].EEP         = radio_events_address_addr;
-    NRF_PPI->CH[channel_ri7_or_10].TEP         = timer0_task_clear_addr;
+    //enable in ri7 in ri10 || dissable in ri8 and ri0
+    NRF_PPI->CH[channel_ri7_or_10].EEP   = radio_events_address_addr;
+    NRF_PPI->CH[channel_ri7_or_10].TEP   = timer0_task_clear_addr;
 
     // enable in ri9 in ri10 or ri1(if the packet received is not for me)  || dissable in ri10 ri0
     NRF_PPI->CH[channel_ri9].EEP         = timer0_events_compare_0_addr;
@@ -841,8 +846,9 @@ void robot_init_setup(void) {
     // DEFAULTS
     // get the robot ID 
     robot_vars.robot_id = get_mote_id();
+    printf("%d",robot_vars.robot_id);
     // calculating the tdma offset for the given robot, depending on the ID assigned to it
-    robot_vars.tdmaDelayTx_ms = tdmaDelayTx(robot_vars.robot_id);
+    robot_vars.DURATION_rt5 = tdmaDelayTx(robot_vars.robot_id) * 16000;
     // create robot bitmask depending on the robot ID, used to check if the Gateway wants the robot to range
     robot_vars.robot_bitmask |= 1 << (robot_vars.robot_id - 1);
 
