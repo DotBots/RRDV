@@ -12,6 +12,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdbool.h>
 
 #include "nrf.h"
 #include "openhdlc.h"
@@ -44,7 +45,8 @@
 #define notifDur_ms        0.65 
 #define tdmaTimeSlot_ms    1.1 
 #define ifsDur_ms          0.1
-#define notifDurAll_ms     (tdmaTimeSlot_ms + ifsDur_ms) * NUMBER_OF_ROBOTS
+#define radioRxOffset_ms   0.1
+#define notifDurAll_ms     (tdmaTimeSlot_ms + radioRxOffset_ms + ifsDur_ms) * NUMBER_OF_ROBOTS
 #define procDelay_ms       0.1//TODO
 #define txUartPrepare_ms   0.1//TODO
 #define maxUartTxDur_ms    10//TODO
@@ -68,7 +70,11 @@
 #define UART_CONFIG_PARITY_POS      1
 #define UART_CONFIG_HWFC            0
 #define UART_CONFIG_HWFC_POS        0
-#define UART_MAX_BYTES              32UL
+#define NUMBER_OF_UART_BYTES_TX     32UL
+#define NUMBER_OF_UART_BYTES_RX     32UL
+
+// HDLC
+#define OUTPUT_BUFFER_MASK          0x1F
 
 // ppi
 #define channel_gi0                     0UL
@@ -115,15 +121,30 @@ typedef enum {
 } gateway_state_t;
 
 typedef struct {
-    //robot
+    //gateway
     gateway_state_t state;
+    uint8_t         robotUsTriggerMask;
     //radio
     uint8_t         dataToSendRadio[NUMBER_OF_RADIO_BYTES_TO_SEND];
     uint8_t         dataReceivedRadio[NUMBER_OF_RADIO_BYTES_RECEIVED];
     uint8_t         radioPacket[NUMBER_OF_RADIO_BYTES_IN_PACKET];
-    //uart
-    uint8_t         dataReceivedUart[UART_MAX_BYTES];
-    uint8_t         dataToSendUart[UART_MAX_BYTES];
+
+    //UART
+    uint8_t         dataReceivedUart[NUMBER_OF_UART_BYTES_RX];
+    uint8_t         dataToSendUart[NUMBER_OF_UART_BYTES_TX];
+    // input
+    uint8_t         inputBuf[NUMBER_OF_UART_BYTES_TX];
+    uint8_t         inputBufFillLevel;
+    uint8_t         hdlcLastRxByte;
+    bool            hdlcBusyReceiving;
+    uint16_t        hdlcInputCrc;
+    bool            hdlcInputEscaping;
+    // output
+    uint8_t         outputBuf[NUMBER_OF_UART_BYTES_TX];
+    uint16_t        outputBufIdxW;
+    uint16_t        outputBufIdxR;
+    bool            fBusyFlushing;
+    uint16_t        hdlcOutputCrc;
     //temp
     uint8_t         uartLastRxByteIndex;
     uint8_t         uartLastTxByteIndex;
@@ -153,6 +174,16 @@ void activity_gie2(void);
 void uart_init(void);
 uint8_t uart_readByte(void);
 void uart_writeByte(uint8_t byteToWrite);
+void handle_uart_rx_frame(void);
+// HDLC output
+void outputHdlcOpen(void);
+void outputHdlcWrite(uint8_t b);
+void outputHdlcClose(void);
+// HDLC input
+void inputHdlcOpen(void);
+void inputHdlcWrite(uint8_t b);
+void inputHdlcClose(void);
+
 // Timer
 void timer_init(void);
 // Radio
@@ -193,9 +224,9 @@ int main(void) {
     gateway_init_setup();  
 
     while (1) {        
-      /*  __WFE();      
+        __WFE();      
         __SEV();
-        __WFE();*/
+        __WFE();
     }
     // one last instruction, doesn't do anything, it's just to have a place to put a breakpoint.
     __NOP();
@@ -338,29 +369,75 @@ void RADIO_IRQHandler(void) {
 //=========================== functions =========================================
 
 void activity_gi0(void){
+    uint8_t rxbyte;
     toggle_isr_debug_pin();
 
-    //TODO change after with HDLC
-    gateway_vars.dataReceivedUart[gateway_vars.uartLastRxByteIndex] = uart_readByte();
+    rxbyte = uart_readByte();
     
-    if (gateway_vars.dataReceivedUart[gateway_vars.uartLastRxByteIndex] == 'a') { //change with hdlc 
-        changeState(S_UARTRXDATA); // switch state to S_UARTRXDATA at the start of the frame
+    if (
+            gateway_vars.hdlcBusyReceiving == false &&
+            gateway_vars.hdlcLastRxByte == HDLC_FLAG &&
+            rxbyte != HDLC_FLAG
+            ) {
+        // start of frame
+        // switch state to S_UARTRXDATA at the start of the frame
+        changeState(S_UARTRXDATA); 
+        // I'm now receiving
+        gateway_vars.hdlcBusyReceiving = true;
+
+        // create the HDLC frame
+        inputHdlcOpen();
+
+        // add the byte just received
+        inputHdlcWrite(rxbyte);
+    } 
+    else if (
+            gateway_vars.hdlcBusyReceiving == true &&
+            rxbyte != HDLC_FLAG
+            ) {
+        // middle of frame
+
+        // add the byte just received
+        inputHdlcWrite(rxbyte);
+        if (gateway_vars.inputBufFillLevel + 1 > NUMBER_OF_UART_BYTES_RX) {
+            // push task
+            printf("HDLC: INPUT BUFFER OVERFLOW");
+            gateway_vars.inputBufFillLevel = 0;
+            gateway_vars.hdlcBusyReceiving = false;
+        }
+    } 
+    else if (
+            gateway_vars.hdlcBusyReceiving == true &&
+            rxbyte == HDLC_FLAG
+            ) {
+        // end of frame
+
+        // finalize the HDLC frame
+        inputHdlcClose();
+        gateway_vars.hdlcBusyReceiving = false;
+
+        if (gateway_vars.inputBufFillLevel == 0) {
+            // push task
+            printf("HDLC: WRONG CRC INPUT");
+        } 
+        else { 
+        // HDLC frame with good CRC received            
+            // change state
+            changeState(S_UARTRXDONE);        
+
+            // clear the timer
+            NRF_TIMER0->TASKS_CLEAR = (TIMER_TASKS_CLEAR_TASKS_CLEAR_Trigger << TIMER_TASKS_CLEAR_TASKS_CLEAR_Pos);
+
+            //set CC[0] to elapse after duration gt0
+            NRF_TIMER0->CC[0] = DURATION_gt0;
+
+            // enable ppi channels for gi1
+            NRF_PPI->CHENSET = ppiChannelSetEnable << channel_gi0;          
+        }
     }
-    else if(gateway_vars.dataReceivedUart[gateway_vars.uartLastRxByteIndex] == 'b') {
-        changeState(S_UARTRXDONE);        // check CRC and then DONE
 
-        // clear the timer
-        NRF_TIMER0->TASKS_CLEAR = (TIMER_TASKS_CLEAR_TASKS_CLEAR_Trigger << TIMER_TASKS_CLEAR_TASKS_CLEAR_Pos);
+    gateway_vars.hdlcLastRxByte = rxbyte;
 
-        //set CC[0] to elapse after duration gt0
-        NRF_TIMER0->CC[0] = DURATION_gt0;
-
-        // enable ppi channels for gi1
-        NRF_PPI->CHENSET = ppiChannelSetEnable << channel_gi0;
-
-    }
-    gateway_vars.uartLastRxByteIndex++;
-    //TODO
     toggle_isr_debug_pin();
 }
 
@@ -382,24 +459,7 @@ void activity_gi1(void) {
     // stop Uart Rx
     NRF_UART0->TASKS_STOPRX = 1UL;
 
-    // prepare the Radio packet
-    gateway_vars.dataToSendRadio[0] = GATEWAY_ID;
-    //gateway_vars.dataToSendRadio[1] = gateway_vars.dataReceivedUart[1];
-    //gateway_vars.dataToSendRadio[2] = gateway_vars.dataReceivedUart[2];
-    //gateway_vars.dataToSendRadio[3] = gateway_vars.dataReceivedUart[3];
-    //gateway_vars.dataToSendRadio[4] = gateway_vars.dataReceivedUart[4];
-    gateway_vars.dataToSendRadio[1] = 0x1F;
-    gateway_vars.dataToSendRadio[2] = 0x00;
-    gateway_vars.dataToSendRadio[3] = 0x00;
-    gateway_vars.dataToSendRadio[4] = 0x00;
-
-    // Load the tx_buffer into memory.
-    memcpy(gateway_vars.radioPacket, gateway_vars.dataToSendRadio, NUMBER_OF_RADIO_BYTES_TO_SEND);
-
-    // Clear the UART Rx buffer
-    memset(gateway_vars.dataToSendRadio, 0, NUMBER_OF_RADIO_BYTES_TO_SEND);
-    // Clear the send buffer
-    memset(gateway_vars.dataReceivedUart, 0, UART_MAX_BYTES);
+    handle_uart_rx_frame();
 
     // enable Radio Tx
     NRF_RADIO->TASKS_TXEN = 1UL;
@@ -492,6 +552,9 @@ void activity_gi5(void) {
 
     // enable ppi channels for gi5
     NRF_PPI->CHENSET = ppiChannelSetEnable << channel_gi5;    
+ 
+    // Write a opening flag to HDLC frame to transmit
+    outputHdlcOpen();
 
     toggle_isr_debug_pin();
 }
@@ -509,19 +572,15 @@ void activity_gi7(void) {
     toggle_isr_debug_pin();
     changeState(S_RADIORXPREPARE);  
 
-    // dissable the ppi channel enabled in gi6
-    //NRF_PPI->CHENCLR = ppiChannelClrEnable << channel_gi6;
-    
-    //TODO start filling UART buffer
     // Copy packet into the Rx buffer.
     memcpy(gateway_vars.dataReceivedRadio, gateway_vars.radioPacket, NUMBER_OF_RADIO_BYTES_IN_PACKET);
 
-    // prepare the UART Tx packet
-    gateway_vars.dataToSendUart[gateway_vars.uartLastTxByteIndex++] = gateway_vars.dataReceivedRadio[0];
-    gateway_vars.dataToSendUart[gateway_vars.uartLastTxByteIndex++] = gateway_vars.dataReceivedRadio[1];
-    gateway_vars.dataToSendUart[gateway_vars.uartLastTxByteIndex++] = gateway_vars.dataReceivedRadio[2];
-    gateway_vars.dataToSendUart[gateway_vars.uartLastTxByteIndex++] = gateway_vars.dataReceivedRadio[3];
-    gateway_vars.dataToSendUart[gateway_vars.uartLastTxByteIndex++] = gateway_vars.dataReceivedRadio[4];
+    // start filling the HDLC frame 
+    outputHdlcWrite(gateway_vars.dataReceivedRadio[0]);
+    outputHdlcWrite(gateway_vars.dataReceivedRadio[1]);
+    outputHdlcWrite(gateway_vars.dataReceivedRadio[2]);
+    outputHdlcWrite(gateway_vars.dataReceivedRadio[3]);
+    outputHdlcWrite(gateway_vars.dataReceivedRadio[4]);
 
     // Clear the Radio Rx buffer
     memset(gateway_vars.dataReceivedRadio, 0, NUMBER_OF_RADIO_BYTES_RECEIVED);
@@ -551,6 +610,9 @@ void activity_gi8(void) {
 
     // enable ppi channels for gi8
     NRF_PPI->CHENSET = ppiChannelSetEnable << channel_gi8;   
+
+    // write final CRC to HDLC frame
+    outputHdlcClose();
     
     changeState(S_UARTTXREADY);     
     toggle_isr_debug_pin();
@@ -558,34 +620,33 @@ void activity_gi8(void) {
 
 void activity_gi9(void) {
     toggle_isr_debug_pin();  
-    
-    // write to uart to trigger the call to gi10
-    uart_writeByte(gateway_vars.dataToSendUart[0]);
+    // I have some bytes to transmit
+    if (gateway_vars.outputBufIdxW != gateway_vars.outputBufIdxR) {     
+         // check if this is the first byte to send
+        if (gateway_vars.outputBufIdxR == 0) {
+            // when sending the first byte
+            changeState(S_UARTTXDATA); // switch state to S_UARTTXDATA at the start of the frame
 
-    //TODO when sending first byte
-        changeState(S_UARTTXDATA); // switch state to S_UARTTXDATA at the start of the frame
-        
-        // dissable the ppi channel enabled in g8
-        NRF_PPI->CHENCLR = ppiChannelClrEnable << channel_gi8;
-        
-        
-        //set CC[0] to elapse after defined duration gt7
-        NRF_TIMER0->CC[0] = DURATION_gt7;
-        
-        NRF_PPI->CHENSET = ppiChannelSetEnable << channel_gie0_or_gie1_or_gie2;
+            // dissable the ppi channel enabled in g8
+            NRF_PPI->CHENCLR = ppiChannelClrEnable << channel_gi8;
+     
+            //set CC[0] to elapse after defined duration gt7
+            NRF_TIMER0->CC[0] = DURATION_gt7;
 
-        //TODO
-
- 
-    //TODO when sending last byte      
-        changeState(S_UARTTXDONE);
+            NRF_PPI->CHENSET = ppiChannelSetEnable << channel_gie0_or_gie1_or_gie2;
+        }  
+        // I have a last byte to send
+        if(gateway_vars.outputBufIdxW == (gateway_vars.outputBufIdxR + 1)) {
+            // before sending last byte      
+            changeState(S_UARTTXDONE);
         
-        // enable ppi channels for gi9 before sending the last byte.
-        NRF_PPI->CHENSET = ppiChannelSetEnable << channel_gi9;    
-
-        gateway_vars.uartLastTxByteIndex = 0;
-
-        //TODO    
+            // enable ppi channels for gi9 before sending the last byte.
+            NRF_PPI->CHENSET = ppiChannelSetEnable << channel_gi9;   
+        }
+        // send byte
+        uart_writeByte(gateway_vars.outputBuf[OUTPUT_BUFFER_MASK & (gateway_vars.outputBufIdxR++)]);
+        //gateway_vars.fBusyFlushing = true;
+    }
 
     toggle_isr_debug_pin();
 }
@@ -600,6 +661,9 @@ void activity_gi10(void) {
 
     // set CC[0] to a default big value which should never be reached
     NRF_TIMER0->CC[0] = defaultCmpValue;
+
+    gateway_vars.outputBufIdxR = 0;
+    gateway_vars.outputBufIdxW = 0;
 
     // start listening to new HDLC frame
     NRF_UART0->TASKS_STARTRX = 1UL;
@@ -670,6 +734,131 @@ uint8_t uart_readByte(void) {
     return NRF_UART0->RXD;
 }
 
+//===== hdlc (output)
+
+/**
+\brief Start an HDLC frame in the output buffer.
+*/
+void outputHdlcOpen(void) {
+    // initialize the value of the CRC
+
+    gateway_vars.hdlcOutputCrc = HDLC_CRCINIT;
+
+    // write the opening HDLC flag
+    gateway_vars.outputBuf[OUTPUT_BUFFER_MASK & (gateway_vars.outputBufIdxW++)] = HDLC_FLAG;
+
+}
+
+/**
+\brief Add a byte to the outgoing HDLC frame being built.
+*/
+void outputHdlcWrite(uint8_t b) {
+
+    // iterate through CRC calculator
+    gateway_vars.hdlcOutputCrc = crcIteration(gateway_vars.hdlcOutputCrc, b);
+
+    // add byte to buffer
+    if (b == HDLC_FLAG || b == HDLC_ESCAPE) {
+        gateway_vars.outputBuf[OUTPUT_BUFFER_MASK & (gateway_vars.outputBufIdxW++)] = HDLC_ESCAPE;
+        b = b ^ HDLC_ESCAPE_MASK;
+    }
+    gateway_vars.outputBuf[OUTPUT_BUFFER_MASK & (gateway_vars.outputBufIdxW++)] = b;
+
+}
+
+/**
+\brief Finalize the outgoing HDLC frame.
+*/
+void outputHdlcClose(void) {
+    uint16_t finalCrc;
+
+    // finalize the calculation of the CRC
+    finalCrc = ~gateway_vars.hdlcOutputCrc;
+
+    // write the CRC value
+    outputHdlcWrite((finalCrc >> 0) & 0xff);
+    outputHdlcWrite((finalCrc >> 8) & 0xff);
+
+    // write the closing HDLC flag
+    gateway_vars.outputBuf[OUTPUT_BUFFER_MASK & (gateway_vars.outputBufIdxW++)] = HDLC_FLAG;
+}
+
+//===== hdlc (input)
+
+/**
+\brief Start an HDLC frame in the input buffer.
+*/
+void inputHdlcOpen(void) {
+    // reset the input buffer index
+    gateway_vars.inputBufFillLevel = 0;
+
+    // initialize the value of the CRC
+    gateway_vars.hdlcInputCrc = HDLC_CRCINIT;
+}
+
+/**
+\brief Add a byte to the incoming HDLC frame.
+*/
+void inputHdlcWrite(uint8_t b) {
+    if (b == HDLC_ESCAPE) {
+        gateway_vars.hdlcInputEscaping = true;
+    } else {
+        if (gateway_vars.hdlcInputEscaping == true) {
+            b = b ^ HDLC_ESCAPE_MASK;
+            gateway_vars.hdlcInputEscaping = false;
+        }
+
+        // add byte to input buffer
+        gateway_vars.inputBuf[gateway_vars.inputBufFillLevel] = b;
+        gateway_vars.inputBufFillLevel++;
+
+        // iterate through CRC calculator
+        gateway_vars.hdlcInputCrc = crcIteration(gateway_vars.hdlcInputCrc, b);
+    }
+}
+
+/**
+\brief Finalize the incoming HDLC frame.
+*/
+void inputHdlcClose(void) {
+
+    // verify the validity of the frame
+    if (gateway_vars.hdlcInputCrc == HDLC_CRCGOOD) {
+        // the CRC is correct
+
+        // remove the CRC from the input buffer
+        gateway_vars.inputBufFillLevel -= 2;
+    } else {
+        // the CRC is incorrect
+
+        // drop the incoming frame
+        gateway_vars.inputBufFillLevel = 0;
+    }
+}
+
+uint16_t crcIteration(uint16_t crc, uint8_t byte) {
+   return (crc >> 8) ^ fcstab[(crc ^ byte) & 0xff];
+}
+
+void handle_uart_rx_frame(void) {
+    // prepare the Radio packet
+    gateway_vars.dataToSendRadio[0] = GATEWAY_ID;
+
+    gateway_vars.dataToSendRadio[1] = gateway_vars.inputBuf[0];
+    gateway_vars.dataToSendRadio[2] = gateway_vars.inputBuf[1];
+    gateway_vars.dataToSendRadio[3] = gateway_vars.inputBuf[2];
+    gateway_vars.dataToSendRadio[4] = gateway_vars.inputBuf[3];
+
+    gateway_vars.inputBufFillLevel = 0;
+
+    // Load the tx_buffer into memory.
+    memcpy(gateway_vars.radioPacket, gateway_vars.dataToSendRadio, NUMBER_OF_RADIO_BYTES_TO_SEND);
+
+    // Clear the radio Tx buffer
+    memset(gateway_vars.dataToSendRadio, 0, NUMBER_OF_RADIO_BYTES_TO_SEND);
+    // Clear the UART Rx buffer
+    memset(gateway_vars.inputBuf, 0, NUMBER_OF_UART_BYTES_RX);
+}
 /**
  * @brief This function sets up Timer0 used as FSM timer 
  * we use only CC[0] compare register
@@ -888,6 +1077,17 @@ void changeState(gateway_state_t newstate) {
  */ 
 void gateway_init_setup(void) {
     // DEFAULTS
+
+    // input
+    gateway_vars.hdlcBusyReceiving = false;
+    gateway_vars.hdlcInputEscaping = false;
+    gateway_vars.inputBufFillLevel = 0;
+
+    // ouput
+    gateway_vars.outputBufIdxR = 0;
+    gateway_vars.outputBufIdxW = 0;
+    //gateway_vars.fBusyFlushing = false;
+
     // default initial state for the RRDV ROBOT FSM
     gateway_vars.state = S_UARTRXENABLE;
     // set CC[0] to a default big value which should never be reached
@@ -926,5 +1126,6 @@ void toggle_isr_debug_pin(void) {
     // Toggle
     NRF_P0->OUT ^= 1 << ISR_DEBUG_PIN;
 }
+
 
 //========================== End of File ========================================
