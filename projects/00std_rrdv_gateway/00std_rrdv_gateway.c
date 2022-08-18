@@ -21,7 +21,7 @@
 
 // gateway
 #define GATEWAY_ID       0x77
-#define NUMBER_OF_ROBOTS 4UL
+#define NUMBER_OF_ROBOTS 5UL
 
 // radio
 #define RADIO_BASE_ADDRESS_0             0x12345678UL 
