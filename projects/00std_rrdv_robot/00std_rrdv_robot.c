@@ -24,7 +24,7 @@
 #define nRF2             0x0e519397b037
 #define nRF3             0xf744aa09cc95
 #define nRF4             0x71f564980c7d
-#define nRF5             0x000000000000
+#define nRF5             0x11837fde1015
 
 // gateway
 #define GATEWAY_ID 0x77
@@ -39,7 +39,7 @@
 // timer 
 #define fromMsToTics     16000 // prescaler 0 -> 16Mhz timer
 #define defaultCmpValue  0xDEADBEEF  // big value to initialize when we don't want timer to elapse
-#define cmdDur_ms        0.65 
+#define cmdDur_ms        0.75 
 #define maxCmdDur_ms     1 
 #define triggerOffset_ms 0.01 
 #define triggerDur_ms    0.01 
@@ -52,7 +52,8 @@
 #define maxNotifDur_ms   1    
 #define tdmaDelayTx(id) (tdmaTimeSlot_ms*id)
 #define DURATION_rt1    maxCmdDur_ms * fromMsToTics 
-#define DURATION_rt2    triggerOffset_ms * fromMsToTics
+//#define DURATION_rt2    triggerOffset_ms * fromMsToTics
+#define DURATION_rt2    (cmdDur_ms + triggerOffset_ms) * fromMsToTics
 #define DURATION_rt3    triggerDur_ms * fromMsToTics
 #define DURATION_rt4    echoDuration_ms * fromMsToTics
 #define DURATION_rt6    (robotTxOffset_ms + wdTx_ms) * fromMsToTics
@@ -322,7 +323,7 @@ void activity_ri0(void){
     NRF_TIMER0->CC[0] = DURATION_rt1;
 
     // enable ppi channel for waiting the end of frame and clear the timer
-    NRF_PPI->CHENSET = ppiChannelSetEnable << channel_ri0_or_ri8;  
+    //NRF_PPI->CHENSET = ppiChannelSetEnable << channel_ri0_or_ri8;  
 
     // enable ppi channel for error state, we reach it if the timer elapses for the maxCmdDur_ms
     NRF_PPI->CHENSET = ppiChannelSetEnable << channel_rie0_or_rie1_or_rie2;
@@ -831,12 +832,16 @@ void changeState(robot_state_t newstate) {
  * @brief This function returns the id of the NRF. We first need to read the MAC address from the device and hard code it as a Macro
  */
 uint8_t get_mote_id(void) {
-    if      (MOTE_ID == nRF1) {return 0x01;}
-    else if (MOTE_ID == nRF2) {return 0x02;}
-    else if (MOTE_ID == nRF3) {return 0x03;}
-    else if (MOTE_ID == nRF4) {return 0x04;}
-    else if (MOTE_ID == nRF5) {return 0x05;}
-    else {printf("ERROR MOTE ID"); return 0;}
+    uint64_t id;
+    
+    id = MOTE_ID & DEVICE_ID_MASK;
+
+    if      (id == nRF1) {return 0x01;}
+    else if (id == nRF2) {return 0x02;}
+    else if (id == nRF3) {return 0x03;}
+    else if (id == nRF4) {return 0x04;}
+    else if (id == nRF5) {return 0x05;}
+    else {printf("ERROR MOTE ID\r\n"); return 0;}
 }
 
 /**
