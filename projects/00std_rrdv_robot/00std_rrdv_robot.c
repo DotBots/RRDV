@@ -13,6 +13,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdbool.h>
 #include "nrf.h"
 
 //============================ defines ==========================================
@@ -43,12 +44,12 @@
 #define maxCmdDur_ms     1 
 #define triggerOffset_ms 0.01 
 #define triggerDur_ms    0.01 
-#define echoDuration_ms  180  
+#define echoDuration_ms  37.1  
 #define tdmaTimeSlot_ms  1.1  
 #define robotTxOffset_ms 1 
 #define wdTx_ms          0.01 
 #define notifDur_ms      0.65 
-#define ifsDur_ms        0.1 
+#define ifsDur_ms        0.3 
 #define maxNotifDur_ms   1    
 #define tdmaDelayTx(id) (tdmaTimeSlot_ms*id)
 #define DURATION_rt1    maxCmdDur_ms * fromMsToTics 
@@ -83,6 +84,7 @@
 #define US_ON_CH                0UL
 #define US_READ_CH_LoToHi       1UL
 #define US_READ_CH_HiToLo       2UL
+#define US_ECHO_ERROR_VALUE     0x01f270   // 127600 us -> equivalent to 22 m distance 
 
 // interrupts
 #define TIMER0_INT_PRIORITY     0UL
@@ -108,13 +110,14 @@ typedef enum {
     S_RADIOTXPREPARE  = 9UL,
     S_RADIOTXREADY    = 10UL,
     S_RADIOTX         = 11UL,
-    S_IFS             = 12UL
+    S_IFS             = 12UL,
+    S_ECHOERROR       = 13UL
 } robot_state_t;
 
 typedef struct {
     //robot
     uint8_t       robot_id;
-    uint16_t      robot_bitmask; // up to 16 robots
+    uint32_t      robot_bitmask; // up to 16 robots
     double        DURATION_rt5;
     robot_state_t state;
     //radio
@@ -125,6 +128,7 @@ typedef struct {
     uint32_t      timeEchoLowHigh;
     uint32_t      timeEchoHighLow;
     uint32_t      usEchoDuration;
+    bool          usEchoDone;
 } robot_vars_t;  
 
                            
@@ -145,6 +149,8 @@ void activity_ri8(void);
 void activity_rie2(void);
 void activity_ri9(void);
 void activity_ri10(void);
+void activity_rie3(void);
+void activity_rie4(void);
 
 // Init
 void gpiote_init(void); 
@@ -178,7 +184,7 @@ int main(void) {
     gpiote_init();
     timer_init();
     radio_init();
-    radio_set_frequency(8);
+    radio_set_frequency(100);
     ppi_setup();
     hfclk_init();
 
@@ -220,6 +226,9 @@ void TIMER0_IRQHandler(void){
         case S_ECHODONE:
             activity_ri6();
             break;      
+        case S_WAITECHOLOW:
+            activity_rie4();
+            break; 
         case S_RADIOTXDELAY:
             activity_ri7();
             break; 
@@ -233,7 +242,7 @@ void TIMER0_IRQHandler(void){
             activity_ri10();
             break;                                  
         default:
-            printf("ERROR FSM STATE IN THE TIMER ISR");
+            printf("ERROR FSM STATE IN THE TIMER ISR\r\n");
             break;
         }   
     }
@@ -244,25 +253,35 @@ void TIMER0_IRQHandler(void){
  * 
  */
 void GPIOTE_IRQHandler(void){   
-    if(NRF_GPIOTE->EVENTS_IN[US_READ_CH_LoToHi] != 0)
-    {
+    if(NRF_GPIOTE->EVENTS_IN[US_READ_CH_LoToHi] != 0) {
         NRF_GPIOTE->EVENTS_IN[US_READ_CH_LoToHi] = 0UL;
 
-        if(robot_vars.state == S_WAITECHOHIGH) {
+        switch (robot_vars.state) {
+        case S_WAITECHOHIGH:
             // capture time when Echo pin goes from LOW to HIGH
             robot_vars.timeEchoLowHigh = NRF_TIMER0->CC[1];
             activity_ri4(robot_vars.timeEchoLowHigh);
+            break;                                                  
+        default:
+            printf("ERROR FSM STATE IN GPIOTE LowToHigh ISR\r\n");
+            break;
         }
-
     }
-    if(NRF_GPIOTE->EVENTS_IN[US_READ_CH_HiToLo] != 0)
-    {
+    if(NRF_GPIOTE->EVENTS_IN[US_READ_CH_HiToLo] != 0) {
         NRF_GPIOTE->EVENTS_IN[US_READ_CH_HiToLo] = 0UL;
 
-        if(robot_vars.state == S_WAITECHOLOW) {
+        switch (robot_vars.state) {
+        case S_WAITECHOLOW:
             // capture time when Echo pin goes from HIGH to LOW
             robot_vars.timeEchoHighLow = NRF_TIMER0->CC[2];
             activity_ri5(robot_vars.timeEchoHighLow);
+            break;              
+        case S_ECHOERROR:
+            activity_rie3();
+            break;                                      
+        default:
+            printf("ERROR FSM STATE IN GPIOTE HighToLow ISR\r\n");
+            break;
         }
     }
 }
@@ -287,7 +306,7 @@ void RADIO_IRQHandler(void) {
             activity_ri8();
             break;                                      
         default:
-            printf("ERROR FSM STATE IN RADIO ISR START OF FRAME");
+            printf("ERROR FSM STATE IN RADIO ISR START OF FRAME\r\n");
             break;
         }
     }
@@ -304,7 +323,7 @@ void RADIO_IRQHandler(void) {
             activity_ri9();
             break;                                      
         default:
-            printf("ERROR FSM STATE IN RADIO ISR END OF FRAME");
+            printf("ERROR FSM STATE IN RADIO ISR END OF FRAME\r\n");
             break;
         }
     }
@@ -429,6 +448,9 @@ void activity_ri3(void) {
 
     // enable the ppi channel for capturing the time when the Echo pin goes High
     NRF_PPI->CHENSET = ppiChannelSetEnable << channel_ri3;
+    
+    // enable the ppi channel for watching where the Timer elapses after echoDuration
+    NRF_PPI->CHENSET = ppiChannelSetEnable << channel_ri5;
     toggle_isr_debug_pin();
 }
 
@@ -450,36 +472,34 @@ void activity_ri4(uint32_t capturedTime) {
 void activity_ri5(uint32_t capturedTime) {
     toggle_isr_debug_pin();
     changeState(S_ECHODONE);
-
+    // set Echo Done flag
+    robot_vars.usEchoDone   = true;
     // dissable the ppi channel for capturing the time when the Echo pin goes Low
     NRF_PPI->CHENCLR = ppiChannelClrEnable << channel_ri4;
 
     // save the time captured when Echo pin went from High to Low
     robot_vars.timeEchoHighLow = capturedTime;
-
     // calculate the pulse duration
     robot_vars.usEchoDuration = (robot_vars.timeEchoHighLow - robot_vars.timeEchoLowHigh)/16;
-    //clear the variables
-    robot_vars.timeEchoHighLow = 0;
-    robot_vars.timeEchoLowHigh = 0;
 
-    // first byte is ROBOT ID
+    //Prepare the packet -> first byte is ROBOT ID
     robot_vars.dataToSendRadio[0] = robot_vars.robot_id;
-
     // send Ultrasound ranging data in us
     robot_vars.dataToSendRadio[1] = robot_vars.usEchoDuration;
     robot_vars.dataToSendRadio[2] = robot_vars.usEchoDuration >> 8;
     robot_vars.dataToSendRadio[3] = robot_vars.usEchoDuration >> 16;
     robot_vars.dataToSendRadio[4] = robot_vars.usEchoDuration >> 24;
-
+    
     // Load the tx_buffer into memory.
     memcpy(robot_vars.radioPacket, robot_vars.dataToSendRadio, NUMBER_OF_BYTES_TO_SEND);
 
     // Clear the send buffer
     memset(robot_vars.dataToSendRadio, 0, NUMBER_OF_BYTES_IN_PACKET);
+    //clear the variables
+    robot_vars.timeEchoHighLow = 0;
+    robot_vars.timeEchoLowHigh = 0;
+    robot_vars.usEchoDuration  = 0;
 
-    // enable the ppi channel for watching where the Timer elapses after echoDuration
-    NRF_PPI->CHENSET = ppiChannelSetEnable << channel_ri5;
     toggle_isr_debug_pin();
 }
 
@@ -582,6 +602,41 @@ void activity_ri10(void) {
     toggle_isr_debug_pin();
 }
 
+void activity_rie3(void) {
+    toggle_isr_debug_pin();
+    // if we end up here it means that the Echo pin was high too long and this function is called when it goes low to restart the FSM
+    changeState(S_RADIORXLISTEN); 
+
+    // set CC[0] to a default big value which should never be reached
+    NRF_TIMER0->CC[0] = defaultCmpValue;
+        
+    // enable the channel to clear the timer when the new frame is received
+    NRF_PPI->CHENSET = ppiChannelSetEnable << channel_ri7_or_10;
+
+    // enable radio packet reception
+    radio_rx_enable();
+
+    toggle_isr_debug_pin();
+}
+
+void activity_rie4(void) {
+    toggle_isr_debug_pin();
+    // change state to Error - the Echo Pulse is too long i.e. the distance is >12 m
+    changeState(S_ECHOERROR);    
+        
+    // dissable the ppi channel set to elapse when Echo measurements are collected
+    NRF_PPI->CHENCLR = ppiChannelClrEnable << channel_ri5;
+
+    // set CC[0] to a default big value which should never be reached
+    NRF_TIMER0->CC[0] = defaultCmpValue;
+
+    //clear the variables for capturing echo pulse duration
+    robot_vars.timeEchoHighLow = 0;
+    robot_vars.timeEchoLowHigh = 0;
+    robot_vars.usEchoDuration  = 0;
+    printf("ERROR ECHO PULSE TOO LONG\r\n");
+    toggle_isr_debug_pin();
+}
 /**
  * @brief Function for initializing GPIOTE for US trigger and US echo signals.
  */
@@ -822,6 +877,7 @@ void changeState(robot_state_t newstate) {
         case S_RADIOTXREADY:
         case S_RADIOTX:
         case S_IFS:
+        case S_ECHOERROR:
             // toggle the pins
             toggle_fsm_debug_pin();
             break;
@@ -850,19 +906,21 @@ uint8_t get_mote_id(void) {
 void robot_init_setup(void) {
     // DEFAULTS
     // get the robot ID 
-    robot_vars.robot_id = get_mote_id();
-    printf("%d",robot_vars.robot_id);
+    robot_vars.robot_id       = get_mote_id();
     // calculating the tdma offset for the given robot, depending on the ID assigned to it
-    robot_vars.DURATION_rt5 = tdmaDelayTx(robot_vars.robot_id) * 16000;
+    robot_vars.DURATION_rt5   = tdmaDelayTx(robot_vars.robot_id) * 16000;
     // create robot bitmask depending on the robot ID, used to check if the Gateway wants the robot to range
     robot_vars.robot_bitmask |= 1 << (robot_vars.robot_id - 1);
+    printf("%d",robot_vars.robot_id);
 
     // default initial state for the RRDV ROBOT FSM
-    robot_vars.state = S_RADIORXLISTEN;
+    robot_vars.state        = S_RADIORXLISTEN;
     // set CC[0] to a default big value which should never be reached
-    NRF_TIMER0->CC[0] = defaultCmpValue;
+    NRF_TIMER0->CC[0]       = defaultCmpValue;
     // start the timer
     NRF_TIMER0->TASKS_START = (TIMER_TASKS_START_TASKS_START_Trigger << TIMER_TASKS_START_TASKS_START_Pos);  
+    // us Echo Done flag
+    robot_vars.usEchoDone   = false;
 
     radio_rx_enable();
 

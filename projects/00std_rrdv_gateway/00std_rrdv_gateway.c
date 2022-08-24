@@ -40,11 +40,11 @@
 #define wdTx_ms            1
 #define triggerOffset_ms   0.01 
 #define triggerDur_ms      0.01 
-#define echoDuration_ms    180.04
+#define echoDuration_ms    37.14
 #define rxPrepare_ms       1    
 #define notifDur_ms        0.65 
 #define tdmaTimeSlot_ms    1.1 
-#define ifsDur_ms          0.1
+#define ifsDur_ms          0.3
 #define radioRxOffset_ms   0.1
 #define notifDurAll_ms     (tdmaTimeSlot_ms + radioRxOffset_ms + ifsDur_ms) * NUMBER_OF_ROBOTS
 #define procDelay_ms       0.1//TODO
@@ -216,7 +216,7 @@ int main(void) {
     uart_init();
     timer_init();
     radio_init();
-    radio_set_frequency(8);
+    radio_set_frequency(100);
     ppi_setup();
     hfclk_init();
 
@@ -700,7 +700,7 @@ void uart_init(void) {
                                     ((uint32_t)GPIO_PIN_CNF_SENSE_Disabled << GPIO_PIN_CNF_SENSE_Pos);
 
     // configure uart
-    NRF_UART0->BAUDRATE = (uint32_t)(UART_BAUDRATE_115200);
+    NRF_UART0->BAUDRATE = (uint32_t)(UART_BAUDRATE_1M);
     NRF_UART0->CONFIG   = (uint32_t)(UART_CONFIG_PARITY << UART_CONFIG_PARITY_POS) |
                           (uint32_t)(UART_CONFIG_HWFC   << UART_CONFIG_HWFC_POS);
 
